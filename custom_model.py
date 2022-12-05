@@ -83,11 +83,9 @@ class AudioLocalizer(nn.Module):
         embedding_act = torch.cat((act_gcc_map, act_logmel_gcc_map, act_intensity_map,act_foa_map), dim=1)
 
         embedding = torch.cat((embedding_obs, embedding_act), dim=1).unsqueeze(1)
-        print("embedding.shape", embedding.shape)
 
         # repeat the input if using the PF-RNN
         embedding = embedding.repeat(self.num_particles, 1,1)
-        print("embedding.shape", embedding.shape)
         seq_len = embedding.size(1)
         hidden = self.init_hidden(batch_size)
 
@@ -123,10 +121,12 @@ class AudioLocalizer(nn.Module):
 
         pred, particle_pred = self.forward(gcc_mic, logmel_mic, intensity_foa, logmel_foa)
 
-        gt_e = gt_pos[:, :, 0]
-        gt_theta = gt_pos[:, :, 1]
+        gt_pos = gt_pos.unsqueeze(1)
+
+        gt_e = gt_pos[:, :, 0].unsqueeze(1)
+        gt_theta = gt_pos[:, :, 1].unsqueeze(1)
         gt_e_normalized = (gt_e - 40) / (80)
-        gt_theta_normalized = (gt_e - 180) / (360)
+        gt_theta_normalized = (gt_theta - 180) / (360)
         gt_normalized = torch.cat([gt_e_normalized, gt_theta_normalized], dim=2)
 
         batch_size = pred.size(1)
@@ -145,45 +145,44 @@ class AudioLocalizer(nn.Module):
         l2_pred_loss = torch.nn.functional.mse_loss(pred, gt_normalized, reduction='none') * bpdecay_params
         l1_pred_loss = torch.nn.functional.l1_loss(pred, gt_normalized, reduction='none') * bpdecay_params
 
-        l2_e_loss = torch.sum(l2_pred_loss[:, :, :2])
-        l2_theta_loss = torch.sum(l2_pred_loss[:, :, 2])
-        l2_loss = l2_e_loss + args.h_weight * l2_theta_loss
+        l2_e_loss = torch.sum(l2_pred_loss[:, :, 0])
+        l2_theta_loss = torch.sum(l2_pred_loss[:, :, 1])
+        l2_loss = l2_e_loss + l2_theta_loss
 
-        l1_xy_loss = torch.mean(l1_pred_loss[:, :, :2])
-        l1_h_loss = torch.mean(l1_pred_loss[:, :, 2])
-        l1_loss = 10*l1_xy_loss + args.h_weight * l1_h_loss
+        l1_xy_loss = torch.mean(l1_pred_loss[:, :, 0])
+        l1_h_loss = torch.mean(l1_pred_loss[:, :, 1])
+        l1_loss = l1_xy_loss + l1_h_loss
 
         pred_loss = args.l2_weight * l2_loss + args.l1_weight * l1_loss
 
         total_loss = pred_loss
 
-        particle_pred = particle_pred.transpose(0, 1).contiguous()
-        particle_gt = gt_normalized.repeat(self.num_particles, 1, 1)
-        l2_particle_loss = torch.nn.functional.mse_loss(particle_pred, particle_gt, reduction='none') * bpdecay_params
-        l1_particle_loss = torch.nn.functional.l1_loss(particle_pred, particle_gt, reduction='none') * bpdecay_params
+        # particle_pred = particle_pred.transpose(0, 1).contiguous()
+        # particle_gt = gt_normalized.repeat(self.num_particles, 1, 1)
+        # l2_particle_loss = torch.nn.functional.mse_loss(particle_pred, particle_gt, reduction='none') * bpdecay_params
+        # l1_particle_loss = torch.nn.functional.l1_loss(particle_pred, particle_gt, reduction='none') * bpdecay_params
 
-        # p(y_t| \tau_{1:t}, x_{1:t}, \theta) is assumed to be a Gaussian with variance = 1.
-        # other more complicated distributions could be used to improve the performance
-        y_prob_l2 = torch.exp(-l2_particle_loss).view(self.num_particles, -1, sl, 3)
-        l2_particle_loss = - y_prob_l2.mean(dim=0).log()
+        # # p(y_t| \tau_{1:t}, x_{1:t}, \theta) is assumed to be a Gaussian with variance = 1.
+        # # other more complicated distributions could be used to improve the performance
+        # y_prob_l2 = torch.exp(-l2_particle_loss).view(self.num_particles, -1, sl, 3)
+        # l2_particle_loss = - y_prob_l2.mean(dim=0).log()
 
-        y_prob_l1 = torch.exp(-l1_particle_loss).view(self.num_particles, -1, sl, 3)
-        l1_particle_loss = - y_prob_l1.mean(dim=0).log()
+        # y_prob_l1 = torch.exp(-l1_particle_loss).view(self.num_particles, -1, sl, 3)
+        # l1_particle_loss = - y_prob_l1.mean(dim=0).log()
 
-        xy_l2_particle_loss = torch.mean(l2_particle_loss[:, :, :2])
-        h_l2_particle_loss = torch.mean(l2_particle_loss[:, :, 2])
-        l2_particle_loss = xy_l2_particle_loss + args.h_weight * h_l2_particle_loss
+        # xy_l2_particle_loss = torch.mean(l2_particle_loss[:, :, :2])
+        # h_l2_particle_loss = torch.mean(l2_particle_loss[:, :, 2])
+        # l2_particle_loss = xy_l2_particle_loss + args.h_weight * h_l2_particle_loss
 
-        xy_l1_particle_loss = torch.mean(l1_particle_loss[:, :, :2])
-        h_l1_particle_loss = torch.mean(l1_particle_loss[:, :, 2])
-        l1_particle_loss = 10 * xy_l1_particle_loss + args.h_weight * h_l1_particle_loss
+        # xy_l1_particle_loss = torch.mean(l1_particle_loss[:, :, :2])
+        # h_l1_particle_loss = torch.mean(l1_particle_loss[:, :, 2])
+        # l1_particle_loss = 10 * xy_l1_particle_loss + args.h_weight * h_l1_particle_loss
 
-        belief_loss = args.l2_weight * l2_particle_loss + args.l1_weight * l1_particle_loss
-        total_loss = total_loss + args.elbo_weight * belief_loss
+        # belief_loss = args.l2_weight * l2_particle_loss + args.l1_weight * l1_particle_loss
+        # total_loss = total_loss + args.elbo_weight * belief_loss
 
-        loss_last = torch.nn.functional.mse_loss(pred[:, -1, :2] * self.map_size, gt_pos[:, -1, :2])
-
-        particle_pred = particle_pred.view(self.num_particles, batch_size, sl, 3)
+        loss_last = torch.nn.functional.mse_loss(pred[:, -1, 0] * 40, gt_pos[:, -1, 0])
+        particle_pred = particle_pred.view(self.num_particles, batch_size, sl, 2)
 
         return total_loss, loss_last, particle_pred
 
