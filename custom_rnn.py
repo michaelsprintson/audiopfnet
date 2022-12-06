@@ -13,11 +13,10 @@ def conv(in_channels, out_channels, kernel_size=3, stride=1,
             nn.Dropout2d(dropout)
             )
 
-class AudioLocalizer(nn.Module):
+class AudioRNN(nn.Module):
 
     def __init__(self, args):
-        super(AudioLocalizer, self).__init__()
-        self.num_particles = args.num_particles
+        super(AudioRNN, self).__init__()
         self.hidden_dim = args.h
         self.img_size = args.img_size
         self.chan_size = args.chan_size
@@ -25,10 +24,12 @@ class AudioLocalizer(nn.Module):
         self.act_emb = args.emb_act
         self.dropout_rate = args.dropout
         self.map_emb = args.map_emb
-        total_emb = self.obs_emb + 3*self.act_emb
+        total_emb = 4*self.obs_emb + 4*self.act_emb
 
-        self.rnn = PFGRUCell(self.num_particles, total_emb, self.hidden_dim,
-                    32, 32, args.resamp_alpha)
+        self.rnn = torch.nn.LSTM(total_emb, self.hidden_dim, batch_first = True)
+        
+        # PFLSTMCell(self.num_particles, total_emb,
+        #         self.hidden_dim, 32, 32, args.resamp_alpha)
 
         self.hidden2label = nn.Linear(self.hidden_dim, 2)
 
@@ -51,9 +52,9 @@ class AudioLocalizer(nn.Module):
     def init_hidden(self, batch_size):
         initializer = torch.rand if self.initialize == 'rand' else torch.zeros
 
-        h0 = initializer(batch_size * self.num_particles, self.hidden_dim)
-        p0 = torch.ones(batch_size * self.num_particles, 1) * np.log(1 / self.num_particles)
-        hidden = (h0, p0)
+        h0 = initializer(1, batch_size, self.hidden_dim)
+        c0 = initializer(1, batch_size, self.hidden_dim)
+        hidden = (h0, c0)
 
         return hidden
 
@@ -63,62 +64,50 @@ class AudioLocalizer(nn.Module):
         else:
             return hidden.detach()
 
-    def proccess_obs(self, pic, bs):
+    def proccess_picture(self, pic, bs):
         emb_pic = self.conv3(self.conv2(self.conv1(pic))).view(bs, -1)
         emb_pic = torch.relu(self.map_embedding(emb_pic))
         obs_map = torch.relu(self.map2obs(emb_pic))
-        return obs_map
-
-    def proccess_act(self, pic, bs):
-        emb_pic = self.conv3(self.conv2(self.conv1(pic))).view(bs, -1)
-        emb_pic = torch.relu(self.map_embedding(emb_pic))
         act_map = torch.relu(self.map2act(emb_pic))
-        return act_map
+        return obs_map, act_map
         
 
     def forward(self, gcc_mic, logmel_mic, intensity_foa, logmel_foa):
         batch_size = gcc_mic.size(0)
-        embedding_obs = self.proccess_obs(gcc_mic, batch_size)
-        act_logmel_gcc_map = self.proccess_act(logmel_mic, batch_size)
-        act_intensity_map = self.proccess_act(intensity_foa, batch_size)
-        act_foa_map = self.proccess_act(logmel_foa, batch_size)
+        obs_gcc_map, act_gcc_map = self.proccess_picture(gcc_mic, batch_size)
+        obs_logmel_gcc_map, act_logmel_gcc_map = self.proccess_picture(logmel_mic, batch_size)
+        obs_intensity_map, act_intensity_map = self.proccess_picture(intensity_foa, batch_size)
+        obs_foa_map, act_foa_map = self.proccess_picture(logmel_foa, batch_size)
 
-        embedding_act = torch.cat((act_logmel_gcc_map, act_intensity_map,act_foa_map), dim=1)
+        embedding_obs = torch.cat((obs_gcc_map, obs_logmel_gcc_map, obs_intensity_map,obs_foa_map), dim=1)
+        embedding_act = torch.cat((act_gcc_map, act_logmel_gcc_map, act_intensity_map,act_foa_map), dim=1)
 
-        embedding = torch.cat((embedding_obs, embedding_act), dim=1).unsqueeze(1)
+        embedding = torch.cat((embedding_obs, embedding_act), dim=1)
+        print(embedding.shape)
 
         # repeat the input if using the PF-RNN
-        embedding = embedding.repeat(self.num_particles, self.num_particles,1)
-        seq_len = embedding.size(1)
         hidden = self.init_hidden(batch_size)
 
-        hidden_states = []
-        probs = []
+        # hidden_states = []
 
-        for step in range(seq_len):
-            hidden = self.rnn(embedding[:, step, :], hidden)
-            hidden_states.append(hidden[0])
-            probs.append(hidden[-1])
+        o, hidden = self.rnn(embedding, hidden)
+        # hidden_states.append(hidden[0])
 
             # if step % self.bp_length == 0:
             #     hidden = self.detach_hidden(hidden)
 
-        hidden_states = torch.stack(hidden_states, dim=0)
-        hidden_states = self.hnn_dropout(hidden_states)
+        # hidden_states = torch.stack(hidden_states, dim=0)
+        # hidden_states = self.hnn_dropout(hidden_states)
 
-        probs = torch.stack(probs, dim=0)
-        prob_reshape = probs.view([seq_len, self.num_particles, -1, 1])
-        out_reshape = hidden_states.view([seq_len, self.num_particles, -1, self.hidden_dim])
-        y = out_reshape * torch.exp(prob_reshape)
-        y = torch.sum(y, dim=1)
-        y = self.hidden2label(y)
-        pf_labels = self.hidden2label(hidden_states)
+        y = self.hidden2label(hidden)
+        # pf_labels = self.hidden2label(hidden_states)
 
         y_out = torch.sigmoid(y)
+        print(y_out.shape)
         
-        pf_out = torch.sigmoid(pf_labels[:, :, :2])
+        # pf_out = torch.sigmoid(pf_labels[:, :, :2])
     
-        return y_out, pf_out
+        return y_out, None
 
     def step(self, gcc_mic, logmel_mic, intensity_foa, logmel_foa, gt_pos, args):
 
@@ -164,35 +153,3 @@ class AudioLocalizer(nn.Module):
         particle_pred = particle_pred.view(self.num_particles, batch_size, sl, 2)
 
         return total_loss, loss_last, pred
-
-
-import os
-import torch
-from torch.utils.data.dataset import Dataset
-import numpy as np
-
-
-class AudioDataset(Dataset):
-    def __init__(self, data, labels):
-        self.data = data
-        self.seq_len = len(self.data[0])
-        self.seq_num = len(self.data)
-        self.labels = labels
-        self.samp_seq_len = None
-
-    def __len__(self):
-        return self.seq_num
-
-    def set_samp_seq_len(self, seq_len):
-        self.samp_seq_len = seq_len
-
-    def __getitem__(self, index):
-        seq_idx = index % self.seq_num
-
-        traj = self.data[seq_idx]
-        lbl = self.labels[seq_idx]
-
-        traj = torch.FloatTensor(traj)
-        lbl = torch.FloatTensor(lbl)
-
-        return (*traj, lbl)
